@@ -1,5 +1,10 @@
 {
-  "CHANNEL_ID": {
-    "channel_name": "NAME"
+  "CHANNEL_ID_1": {
+    "channel_name": "NAME",
+    "mode": "ideas"
+  },
+  "CHANNEL_ID_2": {
+    "channel_name": "NAME",
+    "mode": "demographics"
   }
 }

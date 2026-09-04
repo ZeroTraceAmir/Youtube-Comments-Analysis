@@ -1,55 +1,131 @@
 # yt-idea-bot
 
-Automated tool that monitors YouTube channels via RSS, saves new videos metadata, waits 48 hours, extracts the content ideas from the comments using Gemini and sends them to Discord.
+Automated tool that monitors YouTube channels via RSS, saves new videos metadata, waits 48 hours, reads the comments and sends the results to Telegram. Depending on the channel, it can extract the content ideas from the comments (using AI models through OpenCode Go), estimate the demographics of the commenters (female/male percentage and guessed average age), or both.
+
+How the pipeline works:
+
+```
+┌─────────┐    every 2h     ┌──────────────────────────┐
+│ listener │ ─────────────► │ new videos saved as WAITING │
+└─────────┘                 └──────────────────────────┘
+                                      │ after 48 hours
+┌────────┐    every 2h          ┌─────▼───────────────────────────┐
+│ fetcher │ ───────────────────► │ comments → AI analysis → Telegram │
+└────────┘                      └─────────────────────────────────┘
+```
+
+The 48 hour wait is intentional: it gives the comments time to accumulate before analyzing them.
 
 ---
 
-## Project files
+## Requirements
 
-* **`listener.py`**: Gets new videos from the YouTube RSS feed and saves them to the database.
-* **`fetcher.py`**: Fetches comments for expired videos, processes them with Gemini, and sends the results to Discord.
-* **`database.py`**: Manages the SQLite database.
-* **`utils.py`**: Helper utilities.
-* **`channels.json.example`**: Example file for the channel list that will be monitored.
-* **`.env.example`**: Example file for the environment variables needed.
-* **`pyproject.toml`**: Python project configuration and dependencies.
-* **`cron.template`**: Automation template for cron.
+Before starting, make sure you have:
+
+- A Linux machine (or any machine with `cron`) that stays on — this runs unattended.
+- [Python 3.13+](https://www.python.org/) and [`uv`](https://docs.astral.sh/uv/) installed.
+- A YouTube Data API key (free, from Google Cloud).
+- An OpenCode Go subscription ($10/month) for the AI analysis.
+- A Telegram bot token and a chat ID to receive the results.
+
+The next sections explain where to get each key.
+
 ---
 
-## Setup
+## Setup guide
 
-Install `uv`:
+### Step 1 — Install
+
+Install `uv` (if you don't have it):
+
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-Install python dependencies:
+Then install the Python dependencies from the project root:
 
 ```bash
 uv sync
 ```
 
-## Configuration
+### Step 2 — Get a YouTube API key
 
-### 1. Environment Variables
+1. Go to the [Google Cloud Console](https://console.cloud.google.com/) and create a project (or pick an existing one).
+2. Open **APIs & Services → Library**, search for **YouTube Data API v3** and click **Enable**.
+3. Open **APIs & Services → Credentials**, click **Create credentials → API key** and copy it.
+
+The free quota is enough for this bot: 10,000 units/day, and each page of 100 comments costs 1 unit (a typical video with 500 comments uses ~5 units).
+
+### Step 3 — Get an OpenCode API key
+
+The comment analysis runs on [OpenCode Go](https://opencode.ai/docs/go/), a low cost subscription that gives access to a curated set of open models through an OpenAI-compatible API.
+
+1. Sign in at [opencode.ai/auth](https://opencode.ai/auth).
+2. Subscribe to **OpenCode Go** ($10/month).
+3. Copy your API key.
+
+### Step 4 — Create the Telegram bot
+
+1. Message [@BotFather](https://t.me/BotFather) on Telegram and send `/newbot`. Follow the steps and copy the **bot token**.
+2. Get the **chat ID** where the results should be delivered: send any message to your new bot, then open this URL in a browser (replace `<TOKEN>` with the bot token):
+
+   ```
+   https://api.telegram.org/bot<TOKEN>/getUpdates
+   ```
+
+   Find `"chat":{"id": 123456789,...}` in the response and copy that number. For a group chat, add the bot to the group first; group IDs are negative numbers.
+3. Send at least one message to the bot from that chat (this unlocks the conversation — bots can't message users first).
+
+### Step 5 — Configure the project
+
+Create your local config files from the examples:
 
 ```bash
 cp .env.example .env
-```
-
-Open `.env` and enter your `YOUTUBE_API_KEY`, `GEMINI_API_KEY`, and `DISCORD_WEBHOOK_URL`. It won't work without them.
-
-### 2. Channels list
-
-```bash
 cp channels.json.example channels.json
 ```
 
-Open `channels.json` and add the ID and name of the channels you want to monitor.
+Open `.env` and fill in the four values from the previous steps:
 
-Depending on what you want to monitor, the channel ID prefix will change.
+```
+YOUTUBE_API_KEY="..."
+OPENCODE_API_KEY="..."
+TELEGRAM_BOT_TOKEN="..."
+TELEGRAM_CHAT_ID="..."
+```
 
-These are the prefixes available on YouTube:
+Optionally, set `OPENCODE_MODEL` to change the primary AI model (default: `glm-5.3-flash`).
+
+#### Optional proxy
+
+If your machine needs a proxy to reach the internet (for example, a local Clash/V2Ray SOCKS port), set `PROXY` in `.env`:
+
+```
+PROXY="127.0.0.1:7898"
+```
+
+All outbound traffic (YouTube API, OpenCode Go, Telegram and the RSS feeds) goes through it. Leave it empty (or remove the line) to connect directly.
+
+The `socks5h://` scheme is assumed when not included in the value (the proxy also resolves domain names — the usual setup for Clash/V2Ray). If your proxy speaks plain HTTP instead, write the scheme explicitly: `PROXY="http://127.0.0.1:7898"`. Both scripts log `Using proxy [...]` at startup when it is active.
+
+### Step 6 — Add channels to monitor
+
+Open `channels.json` and add one entry per channel: the feed ID, a name (used in the messages), and the analysis mode:
+
+```json
+{
+  "UCLFxxxxxxxxxxxxxxxxxxx": {
+    "channel_name": "Some Channel",
+    "mode": "ideas"
+  },
+  "UCLFyyyyyyyyyyyyyyyyyyy": {
+    "channel_name": "Other Channel",
+    "mode": "demographics"
+  }
+}
+```
+
+The channel ID prefix changes what the feed contains:
 
 | Prefix | Feed Content          |
 |--------|-----------------------|
@@ -59,49 +135,51 @@ These are the prefixes available on YouTube:
 |  UUSH  | Shorts only           |
 |  UULV  | Live streams only     |
 
-Change it based on what you need. The `UUSH` prefix will be empty because the code is configured to ignore Shorts.
+To get a channel's ID: open the channel page, check the URL (`youtube.com/channel/UC...`) or the source of the page (`"externalId":"UC..."`), then swap the prefix as needed. The `UUSH` prefix is pointless here because the bot ignores Shorts.
 
-### 3. Listener
-In `save_rss_videos()` you can set a different limit of videos to process at once (default is 3). This means that no matter how many videos are in the wait list, only 3 will be processed per channel per batch, leaving the rest for the next cycle.
+#### Analysis modes
 
-### 4. Fetcher
-In `get_expired_videos()` you can change the amount of time it waits to fetch the comments (default is 48h).
+The `mode` field controls what the bot does with each channel's comments:
 
-It's not unusual to get status `500` when trying to call the Gemini API. It uses the free tier, so it has high demand, limits and low priority. Servers can also be overloaded. 
+| Mode           | What it sends to Telegram |
+|----------------|--------------------------|
+| `ideas` (default) | Content ideas extracted from the comments, plus overall feedback about the video |
+| `demographics` | Only the estimated demographics: female/male percentage and guessed average age of the commenters, with the channel name and video title written beside the numbers |
+| `both`         | The ideas analysis followed by the demographics |
 
-There is a fallback strategy to avoid videos piling up in the database due to constant status `500` errors. It will try models from the free tier until it completes the request. After each fail, it will move on to the next model. The order is based on quota limits and model capabilities.
+Demographics output example:
 
-The attempts will follow this order:
+```
+https://youtu.be/VIDEO_ID
+Channel: Some Channel
+Video: Video Title
+Female: 62% | Male: 38%
+Guessed average age: ~24 years
+```
 
- | Model                 | RPM |  TPM  |  RPD  |
- |-----------------------|-----|-------|-------|
- | gemma-4-31b-it        |  30 |   16k | 14.4k |
- | gemma-4-26b-a4b-it    |  30 |   16k | 14.4k |
- | gemini-3.5-flash-lite |  15 |  250k |   500 |
- | gemini-3.1-flash-lite |  15 |  250k |   500 |
- | gemini-3.6-flash      |   5 |  250k |    20 |
- | gemini-3.5-flash      |   5 |  250k |    20 |
- 
-`RPM = Requests Per Minute`
+The mode is read from `channels.json` when the video is processed, so you can change it at any time without touching the database. Omitting the field is the same as using `ideas`.
 
-`TPM = Tokens Per Minute (Input)`
+### Step 7 — Try it
 
-`RPD = Requests Per Day`
+Run the listener once and check that videos appear in the database:
 
-This way we can take advantage of the generous quota from both of the `gemma4` models first and if they fail, we use the quota from `gemini 3` models, which are smaller, but less prone to have status `500` errors.
-
-Videos that fail all attempts to be processed will remain with the `WAITING` status and will be processed in the next cycle.
-
-## Database
-
-The pipeline automatically creates an SQLite database named `yt-pipeline.db`. To completely erase the database, just delete this file from the directory.
-
-If you want to check the contents of the database, run:
 ```bash
+uv run listener.py
 uv run database.py
 ```
 
+New videos are saved with status `WAITING`. Then force the analysis of any video immediately (without waiting 48 hours) and check that the result arrives in Telegram:
+
+```bash
+uv run fetcher.py --url "https://www.youtube.com/watch?v=VIDEO_ID"
+```
+
+If it works, you are ready to automate it.
+
+---
+
 ## Automation (Cron)
+
 To install the automated schedule into your system `crontab`, run this command from the project root:
 
 **IT MUST BE FROM THE PROJECT FOLDER WHERE THE `.py` FILES ARE, OTHERWISE IT WON'T WORK**
@@ -109,9 +187,10 @@ To install the automated schedule into your system `crontab`, run this command f
 ```bash
 sed "s|TARGET_DIRECTORY|$PWD|g" cron.template | crontab -
 ```
+
 This will configure it run `listener.py` every 2h on the odd hours (01, 03, 05...) and run `fetcher.py` every 2h on the even hours (02, 04, 06...).
 
-This means that every 2h it will get the new videos released in the RSS feed and every 2h it will try to analyze the contents and send it to Discord (for expired videos).
+This means that every 2h it will get the new videos released in the RSS feed and every 2h it will try to analyze the contents and send it to Telegram (for expired videos).
 
 Example:
 ```
@@ -126,14 +205,79 @@ Example:
 
 A `pipeline.log` file will be created with the last 1000 entries of the log. You can check it for errors.
 
-## Manual Run
-To force the analysis of a specific video immediately, run:
+To remove the automation, run `crontab -e` and delete the two lines.
 
-```bash
-uv run fetcher.py --url "YOUTUBE_URL"
-```
-This is useful for old videos or channels that you don't want to add in the monitoring list.
-When using manual run, you can check the logs in the terminal.
+---
+
+## Daily usage
+
+| Command | What it does |
+|---------|--------------|
+| `uv run listener.py` | Check the RSS feeds and save new videos (no API keys needed) |
+| `uv run fetcher.py` | Analyze all videos that have been waiting 48h+ and send the results to Telegram |
+| `uv run fetcher.py --url "YOUTUBE_URL"` | Analyze one specific video immediately |
+| `uv run fetcher.py --url "YOUTUBE_URL" --mode demographics` | Same, forcing a mode (`ideas`, `demographics` or `both`) |
+| `uv run database.py` | Print the videos table |
+
+Notes on the manual run:
+
+* Useful for old videos or channels that you don't want to add to the monitoring list.
+* The mode is taken from the video channel's `mode` in `channels.json`, or `ideas` if the channel is not in the list.
+* Logs go to the terminal.
+* The video gets marked as `PROCESSED` in the database, so it won't be processed again.
+
+---
+
+## Tuning
+
+Everything lives in `.env` / `channels.json`, except two numbers defined in code:
+
+* **Videos per cycle** — in `save_rss_videos()` (`database.py`, `insert_limit=3`): only the 3 newest videos per channel are marked as `WAITING` per listener cycle; the rest are stored as `SKIPPED`.
+* **Wait window** — in `get_expired_videos()` (`database.py`, `hours_passed=48`): how long a video waits before its comments get analyzed.
+
+### AI models
+
+The primary model is `glm-5.3-flash` (the cheapest on Go). If a request fails, it falls back to the next model on the list until one completes the task. The order is based on price and usage limits:
+
+ | Model               | Input $/1M | Output $/1M |
+ |---------------------|------------|-------------|
+ | glm-5.3-flash       | 0.15       | 0.50        |
+ | mimo-v2.5           | 0.14       | 0.28        |
+ | deepseek-v4-flash   | 0.22–0.44  | 0.66–1.32   |
+ | qwen3.8-flash       | 0.15       | 0.47        |
+
+`deepseek-v4-flash` peak hours are 01:00–04:00 and 06:00–10:00 UTC; outside those hours it uses the cheaper off-peak price.
+
+You can replace the primary model with any other Go model by setting `OPENCODE_MODEL` in `.env`.
+
+---
+
+## Troubleshooting
+
+* **Check the logs** — with cron, look at `pipeline.log`; with manual runs, read the terminal output.
+* **A video stays in `WAITING` forever** — the analysis or the network failed on every attempt (every model failed). It will be retried automatically on the next cycle; if it never succeeds, check the log for the error.
+* **A video is `SKIPPED`** — it had no comments, comments were disabled, or it was outside the newest 3 of its channel when saved.
+* **Nothing arrives in Telegram** — run `uv run fetcher.py --url "..."` manually and read the log. `Telegram http client error: Unauthorized` means the bot token is wrong; `chat not found` means the chat ID is wrong or you never sent a message to the bot from that chat.
+* **Message lost** — if a message can't be delivered to Telegram after all retries, it is saved to the `failed-messages/` folder instead of being thrown away.
+* **Connection errors everywhere** — if `PROXY` is set in `.env`, make sure the proxy is actually running on that address/port. It must be a SOCKS5 proxy (the default assumed scheme is `socks5h://`); for an HTTP proxy write `PROXY="http://..."`. Clear the setting to connect directly.
+* **Start over** — the pipeline creates an SQLite database named `yt-pipeline.db`. Delete that file to reset everything.
+
+---
+
+## Project files
+
+* **`listener.py`**: Gets new videos from the YouTube RSS feed and saves them to the database.
+* **`fetcher.py`**: Fetches comments for expired videos, analyzes them with OpenCode Go (ideas, demographics or both), and sends the results to Telegram.
+* **`database.py`**: Manages the SQLite database.
+* **`utils.py`**: Helper utilities.
+* **`channels.json.example`**: Example file for the channel list that will be monitored.
+* **`.env.example`**: Example file for the environment variables needed.
+* **`pyproject.toml`**: Python project configuration and dependencies.
+* **`cron.template`**: Automation template for cron.
+
+## Credits
+
+Shoutout to [@perceptreneur](https://github.com/perceptreneur), who originally built this project — this repo is based on their [yt-idea-bot](https://github.com/perceptreneur/yt-idea-bot), with my own modifications on top.
 
 ## License
 MIT
